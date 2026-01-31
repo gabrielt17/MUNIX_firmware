@@ -1,53 +1,223 @@
-#include <Arduino.h>
-#include "Pins.h"
-#include "Motor.h"
+/*
+  OUTPUT: Creating your own hotspot on esp32 wifi+ble module.
+  Author: Ankit Rana (Futechiot)
+  Board Used: esp32 development board, LolinD32,WEMOS LOLIN32, ESP32 MH-ET live Minikit
+  Website: www.futechiot.com
+  GitHub: https://github.com/futechiot
+  
+*/
+
+#include <WiFi.h> 
+#include <Arduino.h>             //wifi library for ESp32 to access other functionalities
 #include <ESP32Encoder.h>
-#include <WiFi.h>                        //Wifi library of Esp32 to access HARDWARRE APIS and othe functionality
+#include "Pins.h"
+#include <Motor.h>
+#include <ArduinoJson.h>
+#include <AsyncTCP.h>
+#include <ESPAsyncWebServer.h>
 
-/* Set these to your Wifi credentials. */
 
-const char*Wifi_ssid = "Tangas_Frouxas";                             // SSID of your Router OR mobile hotspot
-const char*Wifi_password = "tangas321";                       //  PASSWORD of your Router or Mobile hotspot see below example
+// --- CONFIGURAÇÕES ---
+const int PWM_TEST = 256; // PWM de teste (0-1023)
+const int PULSES_PER_REV = 28;
+const uint16_t SAMPLE_TIME = 100; // Amostragem em ms (influencia no cálculo do RPM e resolução)
+const float BIAS_CORRECTION= 1.008840; // Fator calculado via Mínimos Quadrados
+const uint16_t TIMEOUT = 5000; // Tempo em ms para timeout de comunicação
 
-const char *Apssid = "Rede que rouba dados no esp32 hehehe";                      //give Accesspoint SSID, your esp's hotspot name 
-const char *Appassword = "";                           //password of your esp's hotspot
+// --- Configurações de Rede ---
+const char* ssid = "Tangas_Frouxas";
+const char* password = "tangas321";
+
+// --- VARIÁVEIS GLOBAIS ---
+TimerHandle_t encoderTimer = NULL;
+volatile int32_t lpulsesInWindow = 0; // Quantidade de pulsos contados por tempo de amostragem
+volatile int32_t rpulsesInWindow = 0;
+volatile bool calculateRPM = false;
+int16_t currentPWM = 0;
+int16_t current_rpm = 0;
+uint16_t timeoutTimer = 0;
+
+AsyncWebServer server(80);
+AsyncWebSocket ws("/ws");
+
+// Crie um objeto encoder
+ESP32Encoder lencoder;
+ESP32Encoder rencoder;
+
+// Motor A (LEFT)
+Motor lmotor(AIN1, AIN2, PWMA);
+
+// Motor B (RIGHT)
+Motor rmotor(BIN1, BIN2, PWMB, 1);
+
+portMUX_TYPE mux = portMUX_INITIALIZER_UNLOCKED;
+
+// Protótipos de funções
+void gatherEncoderData(TimerHandle_t xTimer);
+void wait(int Time);
+void handleJsonMessage(void *arg, uint8_t *data, size_t len, AsyncWebSocketClient *client);
+void onEvent(AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEventType type,
+             void *arg, uint8_t *data, size_t len);
+
 
 void setup() {
 
-  // put your setup code here, to run once:
+  Serial.begin(115200);                                     
 
-  Serial.begin(115200);               // to enable Serial Commmunication with connected Esp32 board
-  delay(500);
-  WiFi.mode(WIFI_AP_STA);           // changing ESP9266 wifi mode to AP + STATION
+  // WiFi
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(1000); Serial.println("Conectando...");
+  }
+  Serial.println(WiFi.localIP());               
 
-  WiFi.softAP(Apssid, Appassword);         //Starting AccessPoint on given credential
-  IPAddress myIP = WiFi.softAPIP();        //IP Address of our Esp32 accesspoint(where we can host webpages, and see data)
-  Serial.print("Access Point IP address: ");
-  Serial.println(myIP);
-  
-  Serial.println("");
 
-  delay(1500);
-  Serial.println("connecting to Wifi:");
-  Serial.println(Wifi_ssid);
+  encoderTimer = xTimerCreate(
+    "EncoderTimer",                   // Timer name
+    pdMS_TO_TICKS(SAMPLE_TIME),      // Período em ticks
+    pdTRUE,                         // Auto-reload (periodic timer)
+    NULL,                           // Timer ID
+    gatherEncoderData                  // Callback function
+  );
 
-  WiFi.begin(Wifi_ssid, Wifi_password);                  // to tell Esp32 Where to connect and trying to connect
-  while (WiFi.status() != WL_CONNECTED) {                // While loop for checking Internet Connected or not
-    delay(500);
-    Serial.print(".");
+  if (encoderTimer == NULL) {
+    Serial.println("Failed to create timer!");
+    while (1);
   }
 
-  Serial.println("");
-  Serial.println("WiFi connected");
-  Serial.println("IP address: ");
-  Serial.println(WiFi.localIP());            // successful Connection of Esp32,
-                                            // printing Local IP given by your Router or Mobile Hotspot,
-                                           // Esp32 connect at this IP  see in advanced Ip scanner 
-  Serial.println("");
+  rmotor.switchInput();
+  lmotor.switchInput();
 
+  // Habilita os resistores de pull-up internos do ESP32 (recomendado para encoders)
+  ESP32Encoder::useInternalWeakPullResistors = puType::up;
+  // Você também pode usar DOWN se o seu encoder precisar de pull-downs, ou NONE se já tiver resistores externos.
+
+  // Anexa os pinos ao objeto encoder usando o modo de quadratura completa
+  // Isso usa ambas as bordas de ambos os canais A e B para 4x a resolução
+  lencoder.attachFullQuad(encoderAChannel1, encoderAChannel2);
+  rencoder.attachFullQuad(encoderBChannel1, encoderBChannel2);
+
+  lencoder.clearCount();
+  rencoder.clearCount();
+
+  xTimerStart(encoderTimer, 0);
+
+  // Starts the WebSocket server
+  ws.onEvent(onEvent);
+  server.addHandler(&ws);
+  server.begin();
 }
 
 void loop() {
-  // put your main code here, to run repeatedly:
 
+  // Calculates RPM periodically by SAMPLE_TIME ms
+  if (calculateRPM) {
+    int32_t pulses = 0;
+    bool doCalc = false;
+
+    portENTER_CRITICAL(&mux);
+    pulses = lpulsesInWindow;
+    doCalc = calculateRPM;
+    calculateRPM = false;
+    portEXIT_CRITICAL(&mux);
+
+    if (doCalc) {
+      float rpm_raw = ((float)pulses / (float)PULSES_PER_REV) * (60000.0f/(float)SAMPLE_TIME);
+      current_rpm = rpm_raw*BIAS_CORRECTION;
+      Serial.printf(">RPM:%.2f\n", rpm_raw);
+    }
+  }
+  
+  // Stops the motors if no command received within TIMEOUT ms
+  if (millis() - timeoutTimer > TIMEOUT) {
+    currentPWM = 0;
+    lmotor.setSpeed(currentPWM);
+    rmotor.setSpeed(currentPWM);
+  }
+}
+
+// --- Processamento do JSON ---
+void handleJsonMessage(void *arg, uint8_t *data, size_t len, AsyncWebSocketClient *client) {
+  // Creates a JSON buffer
+  JsonDocument doc; 
+
+  // 2. Tries to parse the JSON message
+  DeserializationError error = deserializeJson(doc, data, len);
+
+  if (error) {
+    Serial.print(F("Falha no deserializeJson: "));
+    Serial.println(error.f_str());
+    return;
+  }
+
+  // 3. Verifica qual é o comando
+  const char* command = doc["cmd"]; // "setPWM" ou "getRPM"
+
+  // CASO 1: Escrever PWM
+  if (strcmp(command, "setPWM") == 0) {
+    if(doc["val"].is<int>()) {
+      currentPWM = doc["val"];
+      
+      // Limita entre 0 e 255
+      if(currentPWM > 1023) currentPWM = 1023;
+      if(currentPWM < 0) currentPWM = 0;
+
+      lmotor.setSpeed(currentPWM);
+      rmotor.setSpeed(currentPWM);
+      timeoutTimer = millis(); // Resets timeout timer
+      Serial.printf("Comando recebido: PWM ajustado para %d\n", currentPWM);
+    }
+  }
+  
+  // CASO 2: Solicitar RPM
+  else if (strcmp(command, "getRPM") == 0) {
+    
+    // Prepara a resposta JSON
+    JsonDocument responseDoc;
+    responseDoc["rpm"] = current_rpm;
+    
+    String responseText;
+    serializeJson(responseDoc, responseText);
+    
+    // Envia APENAS para o cliente que solicitou (MATLAB)
+    client->text(responseText);
+    Serial.printf("RPM solicitado. Enviando: %d\n", current_rpm);
+  }
+}
+
+// --- Eventos do WebSocket ---
+void onEvent(AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEventType type,
+             void *arg, uint8_t *data, size_t len) {
+  switch (type) {
+    case WS_EVT_CONNECT:
+      Serial.printf("Cliente conectado %u\n", client->id());
+      break;
+    case WS_EVT_DISCONNECT:
+      Serial.printf("Desconectado: %u\n", client->id());
+      break;
+    case WS_EVT_DATA:
+      // Call handler for JSON message
+      AwsFrameInfo *info = (AwsFrameInfo*)arg;
+      if (info->final && info->index == 0 && info->len == len && info->opcode == WS_TEXT) {
+        handleJsonMessage(arg, data, len, client);
+      }
+      break;
+  }
+}
+
+// ISR for timed gathering of encoder data
+void gatherEncoderData(TimerHandle_t xTimer) {
+  portENTER_CRITICAL(&mux);
+  lpulsesInWindow = lencoder.getCount();
+  rpulsesInWindow = rencoder.getCount();
+  lencoder.clearCount();
+  rencoder.clearCount();
+  calculateRPM = true;
+  portEXIT_CRITICAL(&mux);
+}
+
+// Delay function that doesn't engage sleep mode
+void wait(int time) {
+  int lasttime = millis();
+  vTaskDelay(time / portTICK_PERIOD_MS);
 }
