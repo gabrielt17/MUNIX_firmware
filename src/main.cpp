@@ -1,20 +1,10 @@
-/*
-  OUTPUT: Creating your own hotspot on esp32 wifi+ble module.
-  Author: Ankit Rana (Futechiot)
-  Board Used: esp32 development board, LolinD32,WEMOS LOLIN32, ESP32 MH-ET live Minikit
-  Website: www.futechiot.com
-  GitHub: https://github.com/futechiot
-  
-*/
-
 #include <WiFi.h> 
 #include <Arduino.h>             //wifi library for ESp32 to access other functionalities
 #include <ESP32Encoder.h>
 #include "Pins.h"
 #include <Motor.h>
 #include <ArduinoJson.h>
-#include <AsyncTCP.h>
-#include <ESPAsyncWebServer.h>
+#include <WiFiUdp.h>
 
 
 // --- CONFIGURAÇÕES ---
@@ -22,11 +12,15 @@ const int PWM_TEST = 256; // PWM de teste (0-1023)
 const int PULSES_PER_REV = 28;
 const uint16_t SAMPLE_TIME = 100; // Amostragem em ms (influencia no cálculo do RPM e resolução)
 const float BIAS_CORRECTION= 1.008840; // Fator calculado via Mínimos Quadrados
-const uint16_t TIMEOUT = 5000; // Tempo em ms para timeout de comunicação
+const uint16_t TIMEOUT = 2000; // Tempo em ms para timeout de comunicação
+const int UDP_PORT = 4210;
 
 // --- Configurações de Rede ---
 const char* ssid = "Tangas_Frouxas";
 const char* password = "tangas321";
+
+WiFiUDP udp; // Objeto UDP
+char packetBuffer[255]; // Buffer para receber dados
 
 // --- VARIÁVEIS GLOBAIS ---
 TimerHandle_t encoderTimer = NULL;
@@ -36,9 +30,6 @@ volatile bool calculateRPM = false;
 int16_t currentPWM = 0;
 int16_t current_rpm = 0;
 uint16_t timeoutTimer = 0;
-
-AsyncWebServer server(80);
-AsyncWebSocket ws("/ws");
 
 // Crie um objeto encoder
 ESP32Encoder lencoder;
@@ -55,10 +46,7 @@ portMUX_TYPE mux = portMUX_INITIALIZER_UNLOCKED;
 // Protótipos de funções
 void gatherEncoderData(TimerHandle_t xTimer);
 void wait(int Time);
-void handleJsonMessage(void *arg, uint8_t *data, size_t len, AsyncWebSocketClient *client);
-void onEvent(AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEventType type,
-             void *arg, uint8_t *data, size_t len);
-
+void handleUDPMessage();
 
 void setup() {
 
@@ -102,13 +90,14 @@ void setup() {
 
   xTimerStart(encoderTimer, 0);
 
-  // Starts the WebSocket server
-  ws.onEvent(onEvent);
-  server.addHandler(&ws);
-  server.begin();
+  // Inicia UDP
+  udp.begin(UDP_PORT);
+  Serial.printf("Listening on port %d\n", UDP_PORT);
 }
 
 void loop() {
+
+  handleUDPMessage();
 
   // Calculates RPM periodically by SAMPLE_TIME ms
   if (calculateRPM) {
@@ -124,7 +113,7 @@ void loop() {
     if (doCalc) {
       float rpm_raw = ((float)pulses / (float)PULSES_PER_REV) * (60000.0f/(float)SAMPLE_TIME);
       current_rpm = rpm_raw*BIAS_CORRECTION;
-      Serial.printf(">RPM:%.2f\n", rpm_raw);
+      // Serial.printf(">RPM:%.2f\n", rpm_raw);
     }
   }
   
@@ -137,71 +126,56 @@ void loop() {
 }
 
 // --- Processamento do JSON ---
-void handleJsonMessage(void *arg, uint8_t *data, size_t len, AsyncWebSocketClient *client) {
-  // Creates a JSON buffer
-  JsonDocument doc; 
-
-  // 2. Tries to parse the JSON message
-  DeserializationError error = deserializeJson(doc, data, len);
-
-  if (error) {
-    Serial.print(F("Falha no deserializeJson: "));
-    Serial.println(error.f_str());
-    return;
-  }
-
-  // 3. Verifica qual é o comando
-  const char* command = doc["cmd"]; // "setPWM" ou "getRPM"
-
-  // CASO 1: Escrever PWM
-  if (strcmp(command, "setPWM") == 0) {
-    if(doc["val"].is<int>()) {
-      currentPWM = doc["val"];
-      
-      // Limita entre 0 e 255
-      if(currentPWM > 1023) currentPWM = 1023;
-      if(currentPWM < 0) currentPWM = 0;
-
-      lmotor.setSpeed(currentPWM);
-      rmotor.setSpeed(currentPWM);
-      timeoutTimer = millis(); // Resets timeout timer
-      Serial.printf("Comando recebido: PWM ajustado para %d\n", currentPWM);
-    }
-  }
+void handleUDPMessage() {
   
-  // CASO 2: Solicitar RPM
-  else if (strcmp(command, "getRPM") == 0) {
-    
-    // Prepara a resposta JSON
-    JsonDocument responseDoc;
-    responseDoc["rpm"] = current_rpm;
-    
-    String responseText;
-    serializeJson(responseDoc, responseText);
-    
-    // Envia APENAS para o cliente que solicitou (MATLAB)
-    client->text(responseText);
-    Serial.printf("RPM solicitado. Enviando: %d\n", current_rpm);
-  }
-}
+  int packetSize = udp.parsePacket();
 
-// --- Eventos do WebSocket ---
-void onEvent(AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEventType type,
-             void *arg, uint8_t *data, size_t len) {
-  switch (type) {
-    case WS_EVT_CONNECT:
-      Serial.printf("Cliente conectado %u\n", client->id());
-      break;
-    case WS_EVT_DISCONNECT:
-      Serial.printf("Desconectado: %u\n", client->id());
-      break;
-    case WS_EVT_DATA:
-      // Call handler for JSON message
-      AwsFrameInfo *info = (AwsFrameInfo*)arg;
-      if (info->final && info->index == 0 && info->len == len && info->opcode == WS_TEXT) {
-        handleJsonMessage(arg, data, len, client);
+  if (packetSize) {
+    // Limpa o buffer
+    int len = udp.read(packetBuffer, 255);
+    if (len > 0) packetBuffer[len] = 0;
+
+    // Reset do Timeout
+    timeoutTimer = millis();
+
+    // Parse do JSON
+    JsonDocument doc;
+    DeserializationError error = deserializeJson(doc, packetBuffer);
+
+    if (error) {
+      Serial.print("Erro JSON: "); Serial.println(error.f_str());
+      return;
+    }
+
+    const char* command = doc["cmd"]; 
+
+    // --- COMANDO: setPWM ---
+    if (strcmp(command, "setPWM") == 0) {
+      if(doc["val"].is<int>()){
+        currentPWM = doc["val"];
+        if(currentPWM > 1023) currentPWM = 1023;
+        if(currentPWM < 0) currentPWM = 0;
+        
+        lmotor.setSpeed(currentPWM);
+        rmotor.setSpeed(currentPWM);
+        // Não precisa responder nada para ser rápido, mas pode imprimir no Serial
+        // Serial.printf("PWM: %d\n", currentPWM);
       }
-      break;
+    }
+    
+    // --- COMANDO: getRPM ---
+    else if (strcmp(command, "getRPM") == 0) {
+      // Cria resposta
+      JsonDocument responseDoc;
+      responseDoc["rpm"] = current_rpm;
+      char responseBuffer[64];
+      serializeJson(responseDoc, responseBuffer);
+
+      // Envia de volta para quem perguntou (MATLAB)
+      udp.beginPacket(udp.remoteIP(), udp.remotePort());
+      udp.write((const uint8_t*)responseBuffer, strlen(responseBuffer));
+      udp.endPacket();
+    }
   }
 }
 
