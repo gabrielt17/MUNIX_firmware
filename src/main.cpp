@@ -169,6 +169,15 @@ void handleUDPMessage() {
         rmotor.setSpeed(currentRPWM);
     
         Serial.printf("PWM L: %d R: %d\n", currentLPWM, currentRPWM);
+
+        JsonDocument responseDoc;
+        responseDoc["response"] = "Setting PWM done";
+        char responseBuffer[64];
+        serializeJson(responseDoc, responseBuffer);
+
+        udp.beginPacket(udp.remoteIP(), udp.remotePort());
+        udp.write((const uint8_t*)responseBuffer, strlen(responseBuffer));
+        udp.endPacket();
       }
     }
     // --- COMANDO: getRPM ---
