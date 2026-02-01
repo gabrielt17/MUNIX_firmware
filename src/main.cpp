@@ -27,7 +27,8 @@ TimerHandle_t encoderTimer = NULL;
 volatile int32_t lpulsesInWindow = 0; // Quantidade de pulsos contados por tempo de amostragem
 volatile int32_t rpulsesInWindow = 0;
 volatile bool calculateRPM = false;
-int16_t currentPWM = 0;
+int16_t currentLPWM = 0;
+int16_t currentRPWM = 0;
 int16_t current_rpm = 0;
 uint16_t timeoutTimer = 0;
 
@@ -119,9 +120,10 @@ void loop() {
   
   // Stops the motors if no command received within TIMEOUT ms
   if (millis() - timeoutTimer > TIMEOUT) {
-    currentPWM = 0;
-    lmotor.setSpeed(currentPWM);
-    rmotor.setSpeed(currentPWM);
+    currentLPWM = 0;
+    currentRPWM = 0;
+    lmotor.setSpeed(currentLPWM);
+    rmotor.setSpeed(currentRPWM);
   }
 }
 
@@ -152,14 +154,18 @@ void handleUDPMessage() {
     // --- COMANDO: setPWM ---
     if (strcmp(command, "setPWM") == 0) {
       if(doc["val"].is<int>()){
-        currentPWM = doc["val"];
-        if(currentPWM > 1023) currentPWM = 1023;
-        if(currentPWM < 0) currentPWM = 0;
+        currentLPWM = doc["Lval"];
+        currentRPWM = doc["Rval"];
+
+        if(currentLPWM > 1023) currentLPWM = 1023;
+        if(currentRPWM > 1023) currentRPWM = 1023;
+        if(currentLPWM < 0) currentLPWM = 0;
+        if(currentRPWM < 0) currentRPWM = 0;
         
-        lmotor.setSpeed(currentPWM);
-        rmotor.setSpeed(currentPWM);
+        lmotor.setSpeed(currentLPWM);
+        rmotor.setSpeed(currentRPWM);
         // Não precisa responder nada para ser rápido, mas pode imprimir no Serial
-        // Serial.printf("PWM: %d\n", currentPWM);
+        Serial.printf("PWM L: %d R: %d", currentLPWM, currentRPWM);
       }
     }
     
@@ -172,6 +178,18 @@ void handleUDPMessage() {
       serializeJson(responseDoc, responseBuffer);
 
       // Envia de volta para quem perguntou (MATLAB)
+      udp.beginPacket(udp.remoteIP(), udp.remotePort());
+      udp.write((const uint8_t*)responseBuffer, strlen(responseBuffer));
+      udp.endPacket();
+    }
+
+    else if (strcmp(command, "ping") == 0) {
+      // Responde com "pong"
+      JsonDocument responseDoc;
+      responseDoc["response"] = "pong";
+      char responseBuffer[64];
+      serializeJson(responseDoc, responseBuffer);
+
       udp.beginPacket(udp.remoteIP(), udp.remotePort());
       udp.write((const uint8_t*)responseBuffer, strlen(responseBuffer));
       udp.endPacket();
