@@ -153,22 +153,24 @@ void handleUDPMessage() {
 
     // --- COMANDO: setPWM ---
     if (strcmp(command, "setPWM") == 0) {
-      if(doc["val"].is<int>()){
+    // CORREÇÃO: Verifica se "Lval" existe e é inteiro, em vez de "val"
+      if(doc["Lval"].is<int>() && doc["Rval"].is<int>()){
+    
         currentLPWM = doc["Lval"];
         currentRPWM = doc["Rval"];
 
+       // Trava de segurança (Clamp)
         if(currentLPWM > 1023) currentLPWM = 1023;
         if(currentRPWM > 1023) currentRPWM = 1023;
         if(currentLPWM < 0) currentLPWM = 0;
         if(currentRPWM < 0) currentRPWM = 0;
-        
+    
         lmotor.setSpeed(currentLPWM);
         rmotor.setSpeed(currentRPWM);
-        // Não precisa responder nada para ser rápido, mas pode imprimir no Serial
-        Serial.printf("PWM L: %d R: %d", currentLPWM, currentRPWM);
+    
+        Serial.printf("PWM L: %d R: %d\n", currentLPWM, currentRPWM);
       }
     }
-    
     // --- COMANDO: getRPM ---
     else if (strcmp(command, "getRPM") == 0) {
       // Cria resposta
