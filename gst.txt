@@ -3,3 +3,6 @@ video/x-raw,width=320,height=240,framerate=30/1 ! \
 videorate ! video/x-raw,framerate=15/1 ! \
 jpegenc quality=40 ! \
 udpsink host=127.0.0.1 port=5000 sync=false
+
+
+gst-launch-1.0 v4l2src device=/dev/video1 ! image/jpeg,width=320,height=240,framerate=30/1 ! jpegdec ! videorate ! video/x-raw,framerate=15/1 ! jpegenc quality=30 ! udpsink host=192.168.0.131 port=5000 sync=false

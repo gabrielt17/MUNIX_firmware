@@ -16,8 +16,8 @@ const uint16_t TIMEOUT = 2000; // Tempo em ms para timeout de comunicação
 const int UDP_PORT = 4210;
 
 // --- Configurações de Rede ---
-const char* ssid = "Tangas_Frouxas";
-const char* password = "tangas321";
+const char* ssid = "NERo-Arena";
+const char* password = "BDPsystem10";
 
 WiFiUDP udp; // Objeto UDP
 char packetBuffer[255]; // Buffer para receber dados
